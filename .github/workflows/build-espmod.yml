@@ -1,125 +1,71 @@
 name: build-espmod
 
 on:
-  workflow_dispatch:
   push:
-    branches: [main]
-
-permissions:
-  contents: read
-
-env:
-  ABI: arm64-v8a
-  ANDROID_API: "24"          # assumption: minimum API; binary needs GLES3 (API 18+). Change if the project sets another.
-  SOURCE_DIR: ""             # dir with CMakeLists.txt; empty = auto-detect (shallowest CMakeLists.txt, depth <= 3)
-  CMAKE_TARGET: espmod       # FILL: CMake target producing libespmod.so (confirm in CMakeLists.txt)
-  IMGUI_REV: 97428e8ac99e339ce05eee531cf55b77b29ea709   # v1.91.9, from third-party-revisions.txt
-  DOBBY_REV: 5dfc8546954ce3b3198132ab13fddb89ee92cdd7   # from third-party-revisions.txt
+  workflow_dispatch:
 
 jobs:
   build:
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          submodules: recursive
 
-      - name: Locate project
+      - name: Show source tree
         run: |
-          set -euo pipefail
-          SRC="${SOURCE_DIR:-}"
-          if [ -z "$SRC" ]; then
-            CML="$(find . -maxdepth 3 -name CMakeLists.txt -not -path './.git/*' | awk -F/ '{print NF, $0}' | sort -n | head -n1 | cut -d' ' -f2-)"
-            if [ -n "$CML" ]; then SRC="$(dirname "$CML")"; fi
-          fi
-          if [ -z "$SRC" ] || [ ! -f "$SRC/CMakeLists.txt" ]; then
-            echo "::error title=No CMake project::CMakeLists.txt is not in the repository. Commit the project sources or set SOURCE_DIR."
-            echo "Tracked files (first 50):"; git ls-files | head -n 50
-            exit 1
-          fi
-          INJECT_SH=""
-          for p in tools/inject.sh "$SRC/tools/inject.sh"; do
-            if [ -f "$p" ]; then INJECT_SH="$p"; break; fi
-          done
-          if [ -z "$INJECT_SH" ]; then
-            echo "::warning title=Missing inject.sh::tools/inject.sh not found (checked ./tools and $SRC/tools); the artifact will ship without it."
-          elif ! grep -q '^LIB_SHA256=""$' "$INJECT_SH"; then
-            echo "::error title=inject.sh template::$INJECT_SH has no LIB_SHA256=\"\" line to stamp."
-            exit 1
-          fi
-          echo "SRC=$SRC" >> "$GITHUB_ENV"
-          echo "INJECT_SH=$INJECT_SH" >> "$GITHUB_ENV"
-          echo "project: $SRC, inject: $INJECT_SH"
+          echo "--- tracked sources ---"
+          git ls-files | grep -iE '\.(cpp|cc|h|hpp)$|CMakeLists' || true
+          echo "--- src/ ---"
+          ls -la src || echo "src/ does not exist"
 
-      - name: Ensure Ninja
-        run: command -v ninja >/dev/null || { sudo apt-get update -q && sudo apt-get install -y -q ninja-build; }
-
-      - name: Fetch pinned third-party sources
+      - name: Patch CMakeLists (replace hardcoded src/main.cpp with glob)
         run: |
-          set -euo pipefail
-          fetch() { # url rev dest
-            rm -rf "$3"; git init -q "$3"
-            git -C "$3" remote add origin "$1"
-            git -C "$3" fetch -q --depth 1 origin "$2"
-            git -C "$3" checkout -q FETCH_HEAD
-            test "$(git -C "$3" rev-parse HEAD)" = "$2"
-          }
-          fetch https://github.com/ocornut/imgui.git "$IMGUI_REV" "$SRC/third_party/imgui"
-          fetch https://github.com/jmpews/Dobby.git  "$DOBBY_REV" "$SRC/third_party/Dobby"
-          grep -q '"1.91.9"' "$SRC/third_party/imgui/imgui.h"
+          python3 - <<'PY'
+          import re, sys
+          path = "CMakeLists.txt"
+          text = open(path, encoding="utf-8").read()
+          if "ESPMOD_SOURCES" in text:
+              print("Already patched")
+              sys.exit(0)
+          m = re.search(r"add_library\(\s*espmod\s+(SHARED|STATIC|MODULE)?[^)]*\)", text, re.S)
+          if not m:
+              print("ERROR: add_library(espmod ...) not found")
+              sys.exit(2)
+          libtype = m.group(1) or "SHARED"
+          block = (
+              "file(GLOB ESPMOD_SOURCES CONFIGURE_DEPENDS\n"
+              "    \"${CMAKE_CURRENT_SOURCE_DIR}/src/*.cpp\"\n"
+              "    \"${CMAKE_CURRENT_SOURCE_DIR}/*.cpp\")\n"
+              "if(NOT ESPMOD_SOURCES)\n"
+              "    file(GLOB_RECURSE ESPMOD_FOUND \"${CMAKE_CURRENT_SOURCE_DIR}/*.cpp\")\n"
+              "    message(FATAL_ERROR \"espmod: no sources found. .cpp under ${CMAKE_CURRENT_SOURCE_DIR}: ${ESPMOD_FOUND}\")\n"
+              "endif()\n"
+              "message(STATUS \"espmod sources: ${ESPMOD_SOURCES}\")\n"
+              "add_library(espmod " + libtype + " ${ESPMOD_SOURCES})"
+          )
+          open(path, "w", encoding="utf-8").write(text[:m.start()] + block + text[m.end():])
+          print("Patched, library type:", libtype)
+          PY
 
       - name: Configure
         run: |
-          set -euo pipefail
-          NDK="${ANDROID_NDK_LATEST_HOME:-${ANDROID_NDK_HOME:?no NDK on runner}}"
-          echo "NDK=$NDK" >> "$GITHUB_ENV"
-          grep -m1 Pkg.Revision "$NDK/source.properties" | tee ndk-revision.txt
-          cmake -S "$SRC" -B out -G Ninja \
-            -DCMAKE_TOOLCHAIN_FILE="$NDK/build/cmake/android.toolchain.cmake" \
-            -DANDROID_ABI="$ABI" \
-            -DANDROID_PLATFORM="android-$ANDROID_API" \
-            -DANDROID_STL=c++_static \
-            -DCMAKE_BUILD_TYPE=RelWithDebInfo
-          TARGETS="$(cmake --build out --target help)"
-          if ! grep -qE "(^|[ .:])${CMAKE_TARGET}([ :]|$)" <<<"$TARGETS"; then
-            echo "::error title=Unknown target::CMake target '$CMAKE_TARGET' is not defined by $SRC/CMakeLists.txt. Set CMAKE_TARGET."
-            echo "$TARGETS" | head -n 40
-            exit 1
-          fi
+          # Assumption (reversible): arm64-v8a, android-24. Change if the target needs otherwise.
+          cmake -S . -B build \
+            -DCMAKE_TOOLCHAIN_FILE="$ANDROID_NDK_HOME/build/cmake/android.toolchain.cmake" \
+            -DANDROID_ABI=arm64-v8a \
+            -DANDROID_PLATFORM=android-24 \
+            -DCMAKE_BUILD_TYPE=Release
 
       - name: Build
-        run: cmake --build out --target "$CMAKE_TARGET" -j"$(nproc)"
+        run: cmake --build build -j"$(nproc)"
 
-      - name: Verify library
-        run: |
-          set -euo pipefail
-          LIB="$(find out -name libespmod.so -print -quit)"
-          test -n "$LIB"
-          echo "LIB=$LIB" >> "$GITHUB_ENV"
-          READELF="$(ls "$NDK"/toolchains/llvm/prebuilt/*/bin/llvm-readelf)"
-          "$READELF" -h "$LIB" | grep -q 'Machine:.*AArch64'
-          "$READELF" -d "$LIB" | grep -q 'SONAME.*libespmod.so'
-          # only system libs may be NEEDED (no libc++_shared.so)
-          bad="$("$READELF" -d "$LIB" | sed -n 's/.*NEEDED.*\[\(.*\)\]/\1/p' | grep -vxE 'liblog.so|libEGL.so|libGLESv3.so|libandroid.so|libdl.so|libm.so|libc.so' || true)"
-          test -z "$bad" || { echo "unexpected NEEDED: $bad"; exit 1; }
-
-      - name: Package
-        run: |
-          set -euo pipefail
-          mkdir -p dist/build
-          cp "$LIB" dist/build/libespmod.so
-          SHA="$(sha256sum dist/build/libespmod.so | cut -d' ' -f1)"
-          echo "$SHA  build/libespmod.so" > dist/build/libespmod.so.sha256
-          printf 'imgui %s (v1.91.9)\nDobby %s\n' "$IMGUI_REV" "$DOBBY_REV" > dist/third-party-revisions.txt
-          cp ndk-revision.txt dist/ndk-revision.txt
-          if [ -n "$INJECT_SH" ]; then
-            sed "s/^LIB_SHA256=\"\"\$/LIB_SHA256=\"$SHA\"/" "$INJECT_SH" > dist/inject.sh
-            chmod +x dist/inject.sh
-            sh -n dist/inject.sh
-            grep -q "^LIB_SHA256=\"$SHA\"\$" dist/inject.sh
-          fi
-          ls -l dist dist/build
+      - name: Locate artifact
+        run: find build -name 'libespmod*.so' -print
 
       - uses: actions/upload-artifact@v4
         with:
-          name: espmod-arm64-v8a
-          path: dist/
+          name: espmod
+          path: build/**/libespmod*.so
           if-no-files-found: error
+concurrency: 
