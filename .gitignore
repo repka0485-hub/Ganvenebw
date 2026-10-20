@@ -1,0 +1,4 @@
+out/
+third_party/
+ndk-revision.txt
+dist/
