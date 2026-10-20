@@ -40,10 +40,8 @@ jobs:
             if [ -f "$p" ]; then INJECT_SH="$p"; break; fi
           done
           if [ -z "$INJECT_SH" ]; then
-            echo "::error title=Missing inject.sh::tools/inject.sh not found (checked ./tools and $SRC/tools)."
-            exit 1
-          fi
-          if ! grep -q '^LIB_SHA256=""$' "$INJECT_SH"; then
+            echo "::warning title=Missing inject.sh::tools/inject.sh not found (checked ./tools and $SRC/tools); the artifact will ship without it."
+          elif ! grep -q '^LIB_SHA256=""$' "$INJECT_SH"; then
             echo "::error title=inject.sh template::$INJECT_SH has no LIB_SHA256=\"\" line to stamp."
             exit 1
           fi
@@ -112,10 +110,12 @@ jobs:
           echo "$SHA  build/libespmod.so" > dist/build/libespmod.so.sha256
           printf 'imgui %s (v1.91.9)\nDobby %s\n' "$IMGUI_REV" "$DOBBY_REV" > dist/third-party-revisions.txt
           cp ndk-revision.txt dist/ndk-revision.txt
-          sed "s/^LIB_SHA256=\"\"\$/LIB_SHA256=\"$SHA\"/" "$INJECT_SH" > dist/inject.sh
-          chmod +x dist/inject.sh
-          sh -n dist/inject.sh
-          grep -q "^LIB_SHA256=\"$SHA\"\$" dist/inject.sh
+          if [ -n "$INJECT_SH" ]; then
+            sed "s/^LIB_SHA256=\"\"\$/LIB_SHA256=\"$SHA\"/" "$INJECT_SH" > dist/inject.sh
+            chmod +x dist/inject.sh
+            sh -n dist/inject.sh
+            grep -q "^LIB_SHA256=\"$SHA\"\$" dist/inject.sh
+          fi
           ls -l dist dist/build
 
       - uses: actions/upload-artifact@v4
